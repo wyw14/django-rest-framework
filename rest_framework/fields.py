@@ -5,6 +5,7 @@ import decimal
 import functools
 import inspect
 import re
+import urllib.parse
 import uuid
 import warnings
 from collections.abc import Mapping
@@ -804,13 +805,108 @@ class SlugField(CharField):
 
 class URLField(CharField):
     default_error_messages = {
-        'invalid': _('Enter a valid URL.')
+        'invalid': _('Enter a valid URL.'),
+        'invalid_characters': _('Enter a valid URL. The URL contains invalid characters.'),
+        'double_encoded': _('Enter a valid URL. The URL contains double percent-encoded characters.'),
     }
+
+    # Whitespace and ASCII control characters may never appear unencoded.
+    unsafe_character_regex = re.compile(r'[\s\x00-\x1f\x7f]')
+    # A percent sign that does not begin a valid percent-encoded byte.
+    malformed_percent_regex = re.compile(r'%(?![0-9A-Fa-f]{2})')
+    # A percent-encoded percent sign ("%25") followed by another encoded byte,
+    # e.g. "%2520" is a double-encoded space.
+    double_encoded_regex = re.compile(r'%25[0-9A-Fa-f]{2}')
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         validator = URLValidator(message=self.error_messages['invalid'])
         self.validators.append(validator)
+
+    def to_internal_value(self, data):
+        value = super().to_internal_value(data)
+        return self._canonicalize_url(value)
+
+    def to_representation(self, value):
+        value = super().to_representation(value)
+        # Serialization must not raise validation errors, so fall back to the
+        # plain string representation when the stored value cannot be parsed.
+        with contextlib.suppress(ValidationError, ValueError):
+            return self._canonicalize_url(value)
+        return value
+
+    def _canonicalize_url(self, value):
+        """
+        Validate and canonicalize an absolute URL.
+
+        The host is case folded and internationalized domain names are encoded
+        to ASCII (punycode). The port, path, query and fragment are preserved
+        verbatim, so percent-encoded paths and query parameters keep their
+        original meaning and ordering.
+        """
+        try:
+            split = urllib.parse.urlsplit(value)
+        except ValueError:
+            self.fail('invalid')
+
+        if not split.scheme:
+            # Relative or scheme-less strings stay rejected with the
+            # historical error message.
+            self.fail('invalid')
+
+        if self.unsafe_character_regex.search(value):
+            self.fail('invalid_characters')
+
+        try:
+            encoded_part = split.path
+            if split.query:
+                encoded_part += '?' + split.query
+            if split.fragment:
+                encoded_part += '#' + split.fragment
+            hostname = split.hostname
+            # Accessing ``port`` validates the port and raises ValueError
+            # when it is non-numeric or outside of the valid range.
+            split.port
+            username = split.username
+            password = split.password
+            netloc = split.netloc
+        except ValueError:
+            self.fail('invalid')
+
+        if self.double_encoded_regex.search(encoded_part):
+            self.fail('double_encoded')
+        if self.malformed_percent_regex.search(encoded_part):
+            self.fail('invalid_characters')
+        if not hostname:
+            self.fail('invalid')
+
+        try:
+            hostname = hostname.encode('idna').decode('ascii')
+        except UnicodeError:
+            self.fail('invalid')
+
+        # Preserve any userinfo component verbatim.
+        userinfo = ''
+        if username is not None:
+            userinfo = username
+            if password is not None:
+                userinfo += ':' + password
+            userinfo += '@'
+
+        host_port = netloc.rsplit('@', 1)[-1]
+        if host_port.startswith('['):
+            # IPv6 (or IPvFuture) literal; keep the port suffix verbatim.
+            _, _, port_suffix = host_port.partition(']')
+            netloc = userinfo + '[' + hostname + ']' + port_suffix
+        elif ':' in host_port:
+            _, _, port_suffix = host_port.rpartition(':')
+            netloc = userinfo + hostname + ':' + port_suffix
+        else:
+            netloc = userinfo + hostname
+
+        return urllib.parse.urlunsplit((
+            split.scheme, netloc, split.path, split.query, split.fragment
+        ))
 
 
 class UUIDField(Field):

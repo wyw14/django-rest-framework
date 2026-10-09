@@ -227,6 +227,10 @@ Corresponds to `django.db.models.fields.URLField`.  Uses Django's `django.core.v
 
 **Signature:** `URLField(max_length=200, min_length=None, allow_blank=False)`
 
+Input is normalized before validation: the hostname is case folded and internationalized domain names are encoded to ASCII (punycode), while the port, percent-encoded path, query parameters and fragment are preserved unchanged. Serializing a validated value and submitting it again therefore yields an equivalent URL. Relative or scheme-less strings remain invalid.
+
+Missing schemes, invalid characters (such as whitespace or malformed percent-encoding) and double percent-encoding (e.g. `%2520`) are reported with separate error messages. Plain `CharField` is unaffected and continues to accept relative strings.
+
 ### UUIDField
 
 A field that ensures the input is a valid UUID string. The `to_internal_value` method will return a `uuid.UUID` instance. On output the field will return a string in the canonical hyphenated format, for example:

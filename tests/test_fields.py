@@ -7,6 +7,7 @@ import warnings
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from enum import auto
 from unittest.mock import patch
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -1001,12 +1002,86 @@ class TestURLField(FieldValues):
     """
     valid_inputs = {
         'http://example.com': 'http://example.com',
+        'http://example.com:8080/path?a=1&b=2#fragment':
+            'http://example.com:8080/path?a=1&b=2#fragment',
+        'http://example.com/path%20name?x=%E4%B8%AD':
+            'http://example.com/path%20name?x=%E4%B8%AD',
+        'http://Example.COM:8080/': 'http://example.com:8080/',
+        'http://例え.jp': 'http://xn--r8jz45g.jp',
+        'http://münchen.de:8080/a?b=1': 'http://xn--mnchen-3ya.de:8080/a?b=1',
+        'http://[2001:db8::1]:8080/path': 'http://[2001:db8::1]:8080/path',
+        'https://user:password@xn--r8jz45g.jp:83/x?y=1':
+            'https://user:password@xn--r8jz45g.jp:83/x?y=1',
     }
     invalid_inputs = {
-        'example.com': ['Enter a valid URL.']
+        'example.com': ['Enter a valid URL.'],
+        '/relative/path': ['Enter a valid URL.'],
+        'http://example.com/has space':
+            ['Enter a valid URL. The URL contains invalid characters.'],
+        'http://example.com/a%zz':
+            ['Enter a valid URL. The URL contains invalid characters.'],
+        'http://example.com/a%2520b':
+            ['Enter a valid URL. The URL contains double percent-encoded characters.'],
+        'http://example.com:99999/': ['Enter a valid URL.'],
     }
-    outputs = {}
+    outputs = {
+        'http://example.com': 'http://example.com',
+        'http://例え.jp:8080/path?a=1&b=2':
+            'http://xn--r8jz45g.jp:8080/path?a=1&b=2',
+    }
     field = serializers.URLField()
+
+    def test_error_codes_are_distinguishable(self):
+        """
+        A missing scheme, invalid characters and double percent-encoding
+        each produce a different error code.
+        """
+        def code(value):
+            with pytest.raises(serializers.ValidationError) as exc_info:
+                self.field.run_validation(value)
+            return exc_info.value.detail[0].code
+
+        assert code('example.com/path') == 'invalid'
+        assert code('http://example.com/has space') == 'invalid_characters'
+        assert code('http://example.com/a%2520b') == 'double_encoded'
+
+    @pytest.mark.parametrize('value', [
+        'http://example.com:8080/path?b=2&a=1&z=3#fragment',
+        'http://例え.jp:8080/a%20b/c?x=1&y=%E4%B8%AD',
+        'http://[2001:db8::1]:8080/p?q=1',
+    ])
+    def test_port_path_query_round_trip(self, value):
+        # The normalized internal value serializes back to an equivalent
+        # URL which validates to the same internal value.
+        internal = self.field.run_validation(value)
+        represented = self.field.to_representation(internal)
+        assert represented == internal
+        assert self.field.run_validation(represented) == internal
+        # The port and the query string survive normalization unchanged.
+        assert ':8080' in internal
+        assert urlsplit(internal).query == urlsplit(value).query
+
+    def test_normalization_does_not_change_port(self):
+        value = 'http://例え.jp:8080/'
+        internal = self.field.run_validation(value)
+        assert urlsplit(internal).port == 8080
+        assert internal == 'http://xn--r8jz45g.jp:8080/'
+
+    def test_normalization_is_idempotent(self):
+        internal = self.field.run_validation('http://MÜNCHEN.de:8080/a?b=1')
+        assert self.field.run_validation(internal) == internal
+
+    def test_blank_values_keep_charfield_rules(self):
+        field = serializers.URLField()
+        with pytest.raises(serializers.ValidationError) as exc_info:
+            field.run_validation('   ')
+        assert exc_info.value.detail[0].code == 'blank'
+
+        field = serializers.URLField(allow_blank=True)
+        assert field.run_validation('') == ''
+
+        field = serializers.URLField(allow_null=True)
+        assert field.run_validation(None) is None
 
 
 class TestUUIDField(FieldValues):
