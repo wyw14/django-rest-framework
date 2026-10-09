@@ -232,6 +232,26 @@ The generic views use the `raise_exception=True` flag, which means that you can 
 
 By default this exception results in a response with the HTTP status code "400 Bad Request".
 
+### TransformationError
+
+**Signature:** `TransformationError(detail=None, code=None)`
+
+Raised when incoming primitive data could not be transformed into a native value — that is, during the `.to_internal_value()` phase (including structural input checks such as "expected a dictionary") rather than during validator execution. It is the transformation-phase counterpart of `ValidationError`, which is raised once transformation has succeeded but a validator, a `.validate_<field_name>()` method or a `.validate()` method rejects the value.
+
+`TransformationError` is a subclass of `ValidationError`, so any code that catches `ValidationError` — including REST framework's default exception handler — continues to work unchanged. `serializer.is_valid(raise_exception=True)` raises `TransformationError` when every failure of the run happened during transformation, and `ValidationError` otherwise.
+
+By default this exception results in a response with the HTTP status code "400 Bad Request".
+
+### SaveError
+
+**Signature:** `SaveError(detail=None, code=None, original=None)`
+
+Raised by `serializer.save()` when committing the validated data fails during the `.update()` phase. Any changes applied to the target instance before the failure are rolled back first, so a partially updated object is never left behind. The original exception raised by `.update()` is available both as the `__cause__` of the `SaveError` and on its `.original` attribute.
+
+Exceptions that are themselves REST framework exceptions (such as a `ValidationError` deliberately raised from `.update()`) are re-raised unchanged, and failures during `.create()` continue to propagate their original exception.
+
+By default this exception results in a response with the HTTP status code "500 Internal Server Error".
+
 
 ---
 

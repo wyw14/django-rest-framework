@@ -161,6 +161,47 @@ class ValidationError(APIException):
         self.detail = _get_error_details(detail, code)
 
 
+class TransformationError(ValidationError):
+    """
+    Raised when input data could not be transformed into a native value.
+
+    This is the transformation-phase counterpart of `ValidationError`:
+    `ValidationError` reports values that were transformed successfully
+    but were rejected by validators (field validators,
+    `.validate_<field_name>()` and `.validate()`), whereas
+    `TransformationError` reports failures that occurred while converting
+    the incoming primitives (`.to_internal_value()` and structural input
+    checks such as "expected a dictionary").
+
+    It is a subclass of `ValidationError`, so any code that catches
+    `ValidationError` — including REST framework's default exception
+    handler — continues to behave unchanged.
+    """
+    status_code = status.HTTP_400_BAD_REQUEST
+    default_detail = _('Malformed input data.')
+    default_code = 'transform'
+
+
+class SaveError(APIException):
+    """
+    Raised when `.save()` fails while committing validated data.
+
+    Unlike transformation or validation errors, save errors are reported
+    from `.save()` itself, after any changes already applied to the
+    target instance have been rolled back, so a partially updated object
+    is never left observable. The original exception raised by
+    `.create()` or `.update()` is available as the `__cause__` of the
+    `SaveError` and on its `.original` attribute.
+    """
+    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+    default_detail = _('Failed to save the validated data.')
+    default_code = 'save_error'
+
+    def __init__(self, detail=None, code=None, original=None):
+        super().__init__(detail=detail, code=code)
+        self.original = original
+
+
 class ParseError(APIException):
     status_code = status.HTTP_400_BAD_REQUEST
     default_detail = _('Malformed request.')

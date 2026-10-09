@@ -31,7 +31,9 @@ from django.utils.ipv6 import clean_ipv6_address
 from django.utils.translation import gettext_lazy as _
 
 from rest_framework import DJANGO_DURATION_FORMAT, ISO_8601
-from rest_framework.exceptions import ErrorDetail, ValidationError
+from rest_framework.exceptions import (
+    ErrorDetail, TransformationError, ValidationError
+)
 from rest_framework.settings import api_settings
 from rest_framework.utils import html, humanize_datetime, json, representation
 from rest_framework.utils.formatting import lazy_format
@@ -529,7 +531,15 @@ class Field:
         (is_empty_value, data) = self.validate_empty_values(data)
         if is_empty_value:
             return data
-        value = self.to_internal_value(data)
+        try:
+            value = self.to_internal_value(data)
+        except TransformationError:
+            # The field reported the failure as a transformation error.
+            raise
+        except ValidationError as exc:
+            # Failures while converting the primitive input are reported
+            # separately from failures raised by the field validators.
+            raise TransformationError(exc.detail) from exc
         self.run_validators(value)
         return value
 

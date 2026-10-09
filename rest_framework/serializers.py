@@ -29,7 +29,9 @@ from django.utils.translation import gettext_lazy as _
 
 from rest_framework.compat import postgres_fields
 from rest_framework.deprecation import RemovedInDRF320Warning
-from rest_framework.exceptions import ErrorDetail, ValidationError
+from rest_framework.exceptions import (
+    APIException, ErrorDetail, SaveError, TransformationError, ValidationError
+)
 from rest_framework.fields import get_error_detail
 from rest_framework.settings import api_settings
 from rest_framework.utils import html, model_meta, representation
@@ -202,10 +204,28 @@ class BaseSerializer(Field):
         validated_data = {**self.validated_data, **kwargs}
 
         if self.instance is not None:
-            self.instance = self.update(self.instance, validated_data)
-            assert self.instance is not None, (
+            # Validation only produces temporary results, so the instance
+            # is modified here. Snapshot its observable state and restore
+            # it if `update()` fails partway through - a save failure must
+            # never leave a partially written object behind.
+            instance = self.instance
+            snapshot = self._snapshot_instance(instance)
+            try:
+                updated_instance = self.update(instance, validated_data)
+            except Exception as exc:
+                self._restore_instance(instance, snapshot)
+                if isinstance(exc, APIException):
+                    # Framework exceptions (e.g. `ValidationError` raised
+                    # deliberately from `update()`) keep their semantics.
+                    raise
+                detail = str(exc) or None
+                raise SaveError(detail, original=exc) from exc
+            if updated_instance is None:
+                self._restore_instance(instance, snapshot)
+            assert updated_instance is not None, (
                 '`update()` did not return an object instance.'
             )
+            self.instance = updated_instance
         else:
             self.instance = self.create(validated_data)
             assert self.instance is not None, (
@@ -214,23 +234,123 @@ class BaseSerializer(Field):
 
         return self.instance
 
+    def _snapshot_instance(self, instance):
+        """
+        Capture the observable state of `instance`, so it can be restored
+        if committing validated data fails partway through `.save()`.
+        """
+        if isinstance(instance, Mapping):
+            return ('mapping', copy.copy(instance))
+        if isinstance(instance, list):
+            return (
+                'sequence',
+                list(instance),
+                [self._snapshot_instance(item) for item in instance],
+            )
+        attributes = getattr(instance, '__dict__', None)
+        if attributes is not None:
+            return ('attributes', copy.copy(attributes))
+        return ('none', None)
+
+    def _restore_instance(self, instance, snapshot):
+        """
+        Restore the state captured by `_snapshot_instance()` after a
+        failed `.save()`, so partially applied writes never remain
+        observable on the target instance.
+        """
+        kind = snapshot[0]
+        if kind == 'mapping':
+            instance.clear()
+            instance.update(snapshot[1])
+        elif kind == 'sequence':
+            _, items, item_snapshots = snapshot
+            del instance[:]
+            instance.extend(items)
+            for item, item_snapshot in zip(items, item_snapshots):
+                self._restore_instance(item, item_snapshot)
+        elif kind == 'attributes':
+            instance.__dict__.clear()
+            instance.__dict__.update(snapshot[1])
+
+    def _reset_validation(self):
+        """
+        Discard all temporary results of previous validation runs.
+
+        Every call to `.is_valid()` validates the current `initial_data`
+        from scratch; temporary validated data and errors of a previous
+        run are never reused.
+        """
+        for attr in (
+            '_validated_data', '_errors', '_data',
+            '_transformation_errors', '_validation_errors',
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+    @property
+    def _empty_validated_value(self):
+        # `Serializer` accumulates field values into a dictionary, while
+        # `ListSerializer` uses a list.
+        return {}
+
+    def _record_validation_error(self, exc, default_phase):
+        """
+        Store a failed validation run, keeping transformation failures
+        and validator failures in separate, independently inspectable
+        channels while `.errors` continues to report them all together.
+        """
+        self._validated_data = self._empty_validated_value
+        self._errors = exc.detail
+
+        transformation_errors = getattr(exc, 'transformation_errors', None)
+        validation_errors = getattr(exc, 'validation_errors', None)
+        if transformation_errors is None and validation_errors is None:
+            if default_phase == 'transformation':
+                transformation_errors = exc.detail
+                validation_errors = self._empty_validated_value
+            else:
+                transformation_errors = self._empty_validated_value
+                validation_errors = exc.detail
+        else:
+            if transformation_errors is None:
+                transformation_errors = self._empty_validated_value
+            if validation_errors is None:
+                validation_errors = self._empty_validated_value
+        self._transformation_errors = transformation_errors
+        self._validation_errors = validation_errors
+
     def is_valid(self, *, raise_exception=False):
         assert hasattr(self, 'initial_data'), (
             'Cannot call `.is_valid()` as no `data=` keyword argument was '
             'passed when instantiating the serializer instance.'
         )
 
-        if not hasattr(self, '_validated_data'):
-            try:
-                self._validated_data = self.run_validation(self.initial_data)
-            except ValidationError as exc:
-                self._validated_data = {}
-                self._errors = exc.detail
-            else:
-                self._errors = {}
+        # Never reuse temporary results of a previous run: re-validate
+        # the current `initial_data` every time `.is_valid()` is called.
+        self._reset_validation()
+
+        try:
+            self._validated_data = self.run_validation(self.initial_data)
+        except TransformationError as exc:
+            self._record_validation_error(exc, 'transformation')
+        except ValidationError as exc:
+            self._record_validation_error(exc, 'validation')
+        else:
+            self._errors = self._empty_validated_value
+            self._transformation_errors = self._empty_validated_value
+            self._validation_errors = self._empty_validated_value
 
         if self._errors and raise_exception:
-            raise ValidationError(self.errors)
+            # Re-raise through the phase-specific error channel, so a
+            # transformation failure and a validator failure can be
+            # handled separately by callers that need to.
+            if self._validation_errors and self._transformation_errors:
+                exception = ValidationError(self.errors)
+            elif self._transformation_errors:
+                exception = TransformationError(self.errors)
+            else:
+                exception = ValidationError(self.errors)
+            raise exception
 
         return not bool(self._errors)
 
@@ -261,6 +381,37 @@ class BaseSerializer(Field):
             msg = 'You must call `.is_valid()` before accessing `.errors`.'
             raise AssertionError(msg)
         return self._errors
+
+    @property
+    def transformation_errors(self):
+        """
+        Errors raised while transforming the incoming primitives into
+        native values (`.to_internal_value()` and structural input
+        checks). Empty after a successful run or a validator-only
+        failure.
+        """
+        if not hasattr(self, '_transformation_errors'):
+            msg = (
+                'You must call `.is_valid()` before accessing '
+                '`.transformation_errors`.'
+            )
+            raise AssertionError(msg)
+        return self._transformation_errors
+
+    @property
+    def validation_errors(self):
+        """
+        Errors raised by validators, `.validate_<field_name>()` and
+        `.validate()` once transformation succeeded. Empty after a
+        successful run or a transformation-only failure.
+        """
+        if not hasattr(self, '_validation_errors'):
+            msg = (
+                'You must call `.is_valid()` before accessing '
+                '`.validation_errors`.'
+            )
+            raise AssertionError(msg)
+        return self._validation_errors
 
     @property
     def validated_data(self):
@@ -453,11 +604,16 @@ class Serializer(BaseSerializer, metaclass=SerializerMetaclass):
         if is_empty_value:
             return data
 
+        # Raises `TransformationError` if the incoming data could not be
+        # transformed; let it propagate so callers can tell transformation
+        # failures apart from validator failures.
         value = self.to_internal_value(data)
         try:
             self.run_validators(value)
             value = self.validate(value)
             assert value is not None, '.validate() should return the validated data'
+        except TransformationError:
+            raise
         except (ValidationError, DjangoValidationError) as exc:
             raise ValidationError(detail=as_serializer_error(exc))
 
@@ -498,12 +654,13 @@ class Serializer(BaseSerializer, metaclass=SerializerMetaclass):
             message = self.error_messages['invalid'].format(
                 datatype=type(data).__name__
             )
-            raise ValidationError({
+            raise TransformationError({
                 api_settings.NON_FIELD_ERRORS_KEY: [message]
             }, code='invalid')
 
         ret = {}
         errors = {}
+        transformation_error_fields = set()
         fields = self._writable_fields
 
         for field in fields:
@@ -511,19 +668,59 @@ class Serializer(BaseSerializer, metaclass=SerializerMetaclass):
             primitive_value = field.get_value(data)
             try:
                 validated_value = field.run_validation(primitive_value)
-                if validate_method is not None:
-                    validated_value = validate_method(validated_value)
+            except TransformationError as exc:
+                # The primitive value could not be transformed into a
+                # native value at all.
+                errors[field.field_name] = exc.detail
+                transformation_error_fields.add(field.field_name)
             except ValidationError as exc:
                 errors[field.field_name] = exc.detail
             except DjangoValidationError as exc:
                 errors[field.field_name] = get_error_detail(exc)
+                transformation_error_fields.add(field.field_name)
             except SkipField:
-                pass
+                continue
             else:
-                self.set_value(ret, field.source_attrs, validated_value)
+                try:
+                    if validate_method is not None:
+                        validated_value = validate_method(validated_value)
+                except TransformationError as exc:
+                    errors[field.field_name] = exc.detail
+                    transformation_error_fields.add(field.field_name)
+                except ValidationError as exc:
+                    # The value transformed successfully, but was
+                    # rejected by the field-level validation method.
+                    errors[field.field_name] = exc.detail
+                except DjangoValidationError as exc:
+                    errors[field.field_name] = get_error_detail(exc)
+                else:
+                    self.set_value(ret, field.source_attrs, validated_value)
+                continue
 
         if errors:
-            raise ValidationError(errors)
+            transformation_errors = {
+                field_name: errors[field_name]
+                for field_name in errors
+                if field_name in transformation_error_fields
+            }
+            validation_errors = {
+                field_name: errors[field_name]
+                for field_name in errors
+                if field_name not in transformation_error_fields
+            }
+            # Raise `TransformationError` only when every failure happened
+            # during transformation; otherwise the run carries validator
+            # failures and is reported as a `ValidationError`. Either way
+            # both error channels are attached, so callers can always
+            # inspect the two phases separately.
+            exception = (
+                TransformationError(errors)
+                if not validation_errors
+                else ValidationError(errors)
+            )
+            exception.transformation_errors = transformation_errors
+            exception.validation_errors = validation_errors
+            raise exception
 
         return ret
 
@@ -645,11 +842,16 @@ class ListSerializer(BaseSerializer):
         if is_empty_value:
             return data
 
+        # Raises `TransformationError` if the incoming data could not be
+        # transformed; let it propagate so callers can tell transformation
+        # failures apart from validator failures.
         value = self.to_internal_value(data)
         try:
             self.run_validators(value)
             value = self.validate(value)
             assert value is not None, '.validate() should return the validated data'
+        except TransformationError:
+            raise
         except (ValidationError, DjangoValidationError) as exc:
             raise ValidationError(detail=as_serializer_error(exc))
 
@@ -677,40 +879,54 @@ class ListSerializer(BaseSerializer):
             message = self.error_messages['not_a_list'].format(
                 input_type=type(data).__name__
             )
-            raise ValidationError({
+            raise TransformationError({
                 api_settings.NON_FIELD_ERRORS_KEY: [message]
             }, code='not_a_list')
 
         if not self.allow_empty and len(data) == 0:
             message = self.error_messages['empty']
-            raise ValidationError({
+            raise TransformationError({
                 api_settings.NON_FIELD_ERRORS_KEY: [message]
             }, code='empty')
 
         if self.max_length is not None and len(data) > self.max_length:
             message = self.error_messages['max_length'].format(max_length=self.max_length)
-            raise ValidationError({
+            raise TransformationError({
                 api_settings.NON_FIELD_ERRORS_KEY: [message]
             }, code='max_length')
 
         if self.min_length is not None and len(data) < self.min_length:
             message = self.error_messages['min_length'].format(min_length=self.min_length)
-            raise ValidationError({
+            raise TransformationError({
                 api_settings.NON_FIELD_ERRORS_KEY: [message]
             }, code='min_length')
 
         ret = []
         errors = {}
+        transformation_error_indexes = set()
 
         for index, item in enumerate(data):
             try:
                 validated = self.run_child_validation(item)
+            except TransformationError as exc:
+                errors[index] = exc.detail
+                transformation_error_indexes.add(index)
             except ValidationError as exc:
                 errors[index] = exc.detail
             else:
                 ret.append(validated)
 
         if errors:
+            transformation_errors = {
+                index: errors[index]
+                for index in errors
+                if index in transformation_error_indexes
+            }
+            validation_errors = {
+                index: errors[index]
+                for index in errors
+                if index not in transformation_error_indexes
+            }
             if not api_settings.LIST_SERIALIZER_ERRORS_AS_DICT:
                 warnings.warn(
                     'The list-based error format for `ListSerializer` is '
@@ -721,7 +937,14 @@ class ListSerializer(BaseSerializer):
                     stacklevel=4,
                 )
                 errors = [errors.get(index, {}) for index in range(len(data))]
-            raise ValidationError(errors)
+            exception = (
+                TransformationError(errors)
+                if not validation_errors
+                else ValidationError(errors)
+            )
+            exception.transformation_errors = transformation_errors
+            exception.validation_errors = validation_errors
+            raise exception
 
         return ret
 
@@ -773,10 +996,24 @@ class ListSerializer(BaseSerializer):
         ]
 
         if self.instance is not None:
-            self.instance = self.update(self.instance, validated_data)
-            assert self.instance is not None, (
+            # Undo any partially applied writes if the multiple update
+            # fails partway through.
+            instance = self.instance
+            snapshot = self._snapshot_instance(instance)
+            try:
+                updated_instance = self.update(instance, validated_data)
+            except Exception as exc:
+                self._restore_instance(instance, snapshot)
+                if isinstance(exc, APIException):
+                    raise
+                detail = str(exc) or None
+                raise SaveError(detail, original=exc) from exc
+            if updated_instance is None:
+                self._restore_instance(instance, snapshot)
+            assert updated_instance is not None, (
                 '`update()` did not return an object instance.'
             )
+            self.instance = updated_instance
         else:
             self.instance = self.create(validated_data)
             assert self.instance is not None, (
@@ -785,27 +1022,11 @@ class ListSerializer(BaseSerializer):
 
         return self.instance
 
-    def is_valid(self, *, raise_exception=False):
-        # This implementation is the same as the default,
-        # except that we use lists, rather than dicts, as the empty case.
-        assert hasattr(self, 'initial_data'), (
-            'Cannot call `.is_valid()` as no `data=` keyword argument was '
-            'passed when instantiating the serializer instance.'
-        )
-
-        if not hasattr(self, '_validated_data'):
-            try:
-                self._validated_data = self.run_validation(self.initial_data)
-            except ValidationError as exc:
-                self._validated_data = []
-                self._errors = exc.detail
-            else:
-                self._errors = []
-
-        if self._errors and raise_exception:
-            raise ValidationError(self.errors)
-
-        return not bool(self._errors)
+    @property
+    def _empty_validated_value(self):
+        # List serializers accumulate validated items into a list, and
+        # use lists (rather than dicts) as the empty case.
+        return []
 
     def __repr__(self):
         return representation.list_repr(self, indent=1)

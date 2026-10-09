@@ -104,6 +104,8 @@ If your object instances correspond to Django models you'll also want to ensure 
             instance.save()
             return instance
 
+If `.update()` raises while applying the validated data, `.save()` restores the instance to its pre-save state and raises a `serializers.SaveError` (with the original exception attached), so partially applied updates never remain observable. (REST framework exceptions raised from `.update()`, such as `ValidationError`, are re-raised unchanged, and `.create()` failures propagate their original exception.)
+
 Now when deserializing data, we can call `.save()` to return an object instance, based on the validated data.
 
     comment = serializer.save()
@@ -171,6 +173,27 @@ These exceptions are automatically dealt with by the default exception handler t
 
     # Return a 400 response if the data was invalid.
     serializer.is_valid(raise_exception=True)
+
+#### Temporary validation results and instance state
+
+Validation and persistence are strictly separated. While `.is_valid()` runs, every successfully converted field is collected into a **temporary** result (`serializer.validated_data`); the object passed as `instance` is never modified during validation, even when a later field or object-level validator fails after earlier fields have already passed. The instance is written only when `.save()` is called, after every field and object-level check succeeded:
+
+    serializer = CommentSerializer(instance, data=data)
+    if serializer.is_valid():
+        comment = serializer.save()  # the instance is modified here
+
+Every call to `.is_valid()` validates the current `initial_data` from scratch. Temporary results of a previous run — validated data, errors and cached representation — are discarded, so the same serializer instance can be reused for different inputs without the previous run's temporary values leaking into the new run.
+
+#### Transformation, validation and save errors
+
+Failures are reported separately depending on the phase in which they occur:
+
+* **Transformation errors** happen while the incoming primitives are converted to native values (`.to_internal_value()` and structural input checks). They are available as `serializer.transformation_errors`, and `is_valid(raise_exception=True)` raises `serializers.TransformationError`.
+* **Validation errors** happen after conversion, in field validators, `.validate_<field_name>()` or `.validate()`. They are available as `serializer.validation_errors`, and `is_valid(raise_exception=True)` raises `serializers.ValidationError`.
+* Both kinds are also reported together through the usual `serializer.errors` property, with the same field-keyed structure and error messages. If a run fails in both phases at once, both properties are populated and a `ValidationError` is raised.
+* **Save errors** happen while `.save()` commits the validated data. They are raised as `serializers.SaveError` from `.save()` (the original exception is attached as `.original` / `__cause__`), after any changes already applied to the instance have been rolled back, so a failed save never leaves a partially updated object.
+
+`TransformationError` is a subclass of `ValidationError`, so existing code that catches `ValidationError` keeps working unchanged.
 
 #### Field-level validation
 
@@ -1047,6 +1070,8 @@ May be overridden in order to modify the representation style. For example:
 Takes the unvalidated incoming data as input and should return the validated data that will be made available as `serializer.validated_data`. The return value will also be passed to the `.create()` or `.update()` methods if `.save()` is called on the serializer class.
 
 If any of the validation fails, then the method should raise a `serializers.ValidationError(errors)`. The `errors` argument should be a dictionary mapping field names (or `settings.NON_FIELD_ERRORS_KEY`) to a list of error messages. If you don't need to alter deserialization behavior and instead want to provide object-level validation, it's recommended that you instead override the [`.validate()`](#object-level-validation) method.
+
+Failures that occur while converting the incoming data may be raised as `serializers.TransformationError(errors)` instead, so callers can distinguish input that could not be transformed from input that was transformed but rejected by validators. `TransformationError` is a subclass of `ValidationError`, and both are handled through the same `.errors` structure.
 
 The `data` argument passed to this method will normally be the value of `request.data`, so the datatype it provides will depend on the parser classes you have configured for your API.
 
