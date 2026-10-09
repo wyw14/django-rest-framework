@@ -1,4 +1,5 @@
 import datetime
+import ipaddress
 import math
 import os
 import re
@@ -1093,6 +1094,226 @@ class TestIPv6AddressField(FieldValues):
     }
     outputs = {}
     field = serializers.IPAddressField(protocol='IPv6')
+
+
+class TestIPNetworkField(FieldValues):
+    """
+    Valid and invalid values for `IPNetworkField`
+    """
+    valid_inputs = {
+        # Plain addresses.
+        '127.0.0.1': '127.0.0.1',
+        '192.168.33.255': '192.168.33.255',
+        '2001:cdba::3257:9652': '2001:cdba::3257:9652',
+        # Surrounding whitespace is stripped and hextets are normalized.
+        '  127.0.0.1  ': '127.0.0.1',
+        '\t2001:0DB8:85A3:0042:1000:8A2E:0370:7334\r\n':
+            '2001:db8:85a3:42:1000:8a2e:370:7334',
+        '  10.0.0.0/8  ': '10.0.0.0/8',
+        '2001:DB8::1/64 ': '2001:db8::/64',
+        # Host bits are removed and prefixes are normalized.
+        '192.168.1.5/24': '192.168.1.0/24',
+        '192.168.1.0/255.255.255.0': '192.168.1.0/24',
+        '192.168.1.0/024': '192.168.1.0/24',
+        '2001:cdba:0:0:0:0:3257:9652/64': '2001:cdba::/64',
+        # IPv4-mapped IPv6 values are unpacked when protocol is 'both'.
+        '::ffff:192.0.2.1': '192.0.2.1',
+        '::ffff:192.0.2.1/128': '192.0.2.1/32',
+        '::ffff:192.0.2.0/120': '192.0.2.0/24',
+        # Boundary prefix lengths.
+        '0.0.0.0/0': '0.0.0.0/0',
+        '192.168.1.0/32': '192.168.1.0/32',
+        '::/0': '::/0',
+        '2001:db8::/128': '2001:db8::/128',
+    }
+    invalid_inputs = {
+        '127001': ['Enter a valid IPv4 or IPv6 address or network.'],
+        '127.122.111.2231': ['Enter a valid IPv4 or IPv6 address or network.'],
+        'not-an-ip': ['Enter a valid IPv4 or IPv6 address or network.'],
+        '2001:::9652/64': ['Enter a valid IPv4 or IPv6 address or network.'],
+        # Illegal prefix lengths.
+        '192.168.1.0/33': ['Enter a valid IPv4 or IPv6 address or network.'],
+        '10.0.0.0/-1': ['Enter a valid IPv4 or IPv6 address or network.'],
+        '2001:db8::/129': ['Enter a valid IPv4 or IPv6 address or network.'],
+        '192.168.1.0/abc': ['Enter a valid IPv4 or IPv6 address or network.'],
+        '192.168.1.0/24/8': ['Enter a valid IPv4 or IPv6 address or network.'],
+        '192.168.1.0/': ['Enter a valid IPv4 or IPv6 address or network.'],
+        '/24': ['Enter a valid IPv4 or IPv6 address or network.'],
+        # Empty values follow the CharField rules.
+        '': ['This field may not be blank.'],
+        '   ': ['This field may not be blank.'],
+        # Non-string values are never coerced.
+        123: ['Enter a valid IPv4 or IPv6 address or network.'],
+        True: ['Enter a valid IPv4 or IPv6 address or network.'],
+    }
+    outputs = {
+        '192.168.1.5/24': '192.168.1.0/24',
+        '  2001:DB8::/32 ': '2001:db8::/32',
+        ipaddress.IPv4Network('10.0.0.0/8'): '10.0.0.0/8',
+        ipaddress.IPv6Network('2001:DB8::/32'): '2001:db8::/32',
+        ipaddress.IPv4Address('10.0.0.1'): '10.0.0.1',
+        ipaddress.IPv6Address('2001:db8::1'): '2001:db8::1',
+    }
+    field = serializers.IPNetworkField()
+
+
+class TestIPv4NetworkField(FieldValues):
+    """
+    Valid and invalid values for `IPNetworkField` with protocol='IPv4'
+    """
+    valid_inputs = {
+        '127.0.0.1': '127.0.0.1',
+        ' 192.168.1.0/24 ': '192.168.1.0/24',
+        '192.168.1.5/24': '192.168.1.0/24',
+    }
+    invalid_inputs = {
+        '127001': ['Enter a valid IPv4 address or network.'],
+        '192.168.1.0/33': ['Enter a valid IPv4 address or network.'],
+        # IPv6 (including IPv4-mapped values) is another address family.
+        '2001:db8::/32': ['Enter a valid IPv4 address or network.'],
+        '::ffff:192.0.2.1': ['Enter a valid IPv4 address or network.'],
+    }
+    outputs = {
+        ipaddress.IPv4Network('10.0.0.0/8'): '10.0.0.0/8',
+    }
+    field = serializers.IPNetworkField(protocol='IPv4')
+
+
+class TestIPv6NetworkField(FieldValues):
+    """
+    Valid and invalid values for `IPNetworkField` with protocol='IPv6'
+    """
+    valid_inputs = {
+        '2001:db8::/32': '2001:db8::/32',
+        '2001:0DB8::0001': '2001:db8::1',
+        ' 2001:cdba:0:0:0:0:3257:9652/64 ': '2001:cdba::/64',
+        # Mapped values are kept in canonical mapped form (not unpacked).
+        '::ffff:192.0.2.1': '::ffff:192.0.2.1',
+        '::ffff:192.0.2.0/120': '::ffff:192.0.2.0/120',
+    }
+    invalid_inputs = {
+        '2001:db8::/129': ['Enter a valid IPv6 address or network.'],
+        # IPv4 is another address family.
+        '192.0.2.1': ['Enter a valid IPv6 address or network.'],
+        '192.0.2.0/24': ['Enter a valid IPv6 address or network.'],
+    }
+    outputs = {
+        ipaddress.IPv6Network('2001:DB8::/32'): '2001:db8::/32',
+    }
+    field = serializers.IPNetworkField(protocol='IPv6')
+
+
+class TestIPNetworkFieldBehavior(TestCase):
+    def test_round_trip(self):
+        # The serialized representation must be parseable again and remain
+        # stable across repeated parse/serialize cycles.
+        field = serializers.IPNetworkField()
+        for value in (
+            '127.0.0.1',
+            '192.168.1.0/24',
+            '192.168.1.5/24',
+            '10.0.0.0/255.0.0.0',
+            '2001:db8::/32',
+            '2001:0DB8:85a3::1/64',
+            '::ffff:192.0.2.1',
+            '::ffff:192.0.2.0/120',
+            '0.0.0.0/0',
+            '::/0',
+        ):
+            normalized = field.run_validation(value)
+            self.assertEqual(normalized, field.run_validation(normalized))
+            self.assertEqual(normalized, field.to_representation(normalized))
+
+    def test_to_representation_normalizes_objects(self):
+        field = serializers.IPNetworkField()
+        self.assertEqual(
+            field.to_representation(ipaddress.IPv4Interface('10.0.0.1/8')),
+            '10.0.0.0/8'
+        )
+        self.assertEqual(
+            field.to_representation(ipaddress.IPv6Interface('2001:db8::1/32')),
+            '2001:db8::/32'
+        )
+        # Values that cannot be parsed are returned untouched rather than
+        # breaking serialization.
+        self.assertEqual(field.to_representation('unknown'), 'unknown')
+
+    def test_empty_values_follow_field_rules(self):
+        field = serializers.IPNetworkField()
+        for value in ('', '   '):
+            with self.assertRaises(serializers.ValidationError) as ctx:
+                field.run_validation(value)
+            self.assertEqual(ctx.exception.detail, ['This field may not be blank.'])
+
+        with self.assertRaises(serializers.ValidationError) as ctx:
+            field.run_validation(None)
+        self.assertEqual(ctx.exception.detail, ['This field may not be null.'])
+
+        blank = serializers.IPNetworkField(allow_blank=True)
+        self.assertEqual(blank.run_validation(''), '')
+        self.assertEqual(blank.run_validation('   '), '')
+
+        nullable = serializers.IPNetworkField(allow_null=True)
+        self.assertIsNone(nullable.run_validation(None))
+
+    def test_trim_whitespace_can_be_disabled(self):
+        field = serializers.IPNetworkField(trim_whitespace=False)
+        with self.assertRaises(serializers.ValidationError):
+            field.run_validation(' 10.0.0.0/8 ')
+        self.assertEqual(field.run_validation('10.0.0.0/8'), '10.0.0.0/8')
+
+    def test_unknown_protocol(self):
+        with self.assertRaises(ValueError):
+            serializers.IPNetworkField(protocol='ipx')
+
+    def test_repr(self):
+        self.assertEqual(repr(serializers.IPNetworkField()), 'IPNetworkField()')
+        self.assertEqual(
+            repr(serializers.IPNetworkField(protocol='IPv6')),
+            "IPNetworkField(protocol='IPv6')"
+        )
+
+    def test_partial_update_keeps_existing_address(self):
+        class IPSerializer(serializers.Serializer):
+            address = serializers.IPNetworkField()
+            label = serializers.CharField(required=False, allow_blank=True)
+
+        instance = {'address': '192.0.2.0/24', 'label': 'old'}
+
+        # Omitting the address in a partial update must not wipe it.
+        partial = IPSerializer(instance, data={'label': 'new'}, partial=True)
+        self.assertTrue(partial.is_valid(), partial.errors)
+        self.assertNotIn('address', partial.validated_data)
+        self.assertEqual(partial.data['address'], '192.0.2.0/24')
+
+        # Providing an address still updates (and normalizes) it.
+        update = IPSerializer(instance, data={'address': ' 10.0.0.0/8 '}, partial=True)
+        self.assertTrue(update.is_valid(), update.errors)
+        self.assertEqual(update.validated_data['address'], '10.0.0.0/8')
+
+        # A non-partial update still treats the field as required.
+        full = IPSerializer(instance, data={'label': 'new'})
+        self.assertFalse(full.is_valid())
+        self.assertIn('address', full.errors)
+
+    def test_plain_ip_address_field_still_rejects_networks(self):
+        # The strict address field keeps rejecting CIDR notation.
+        field = serializers.IPAddressField()
+        for value in ('192.168.1.0/24', '2001:db8::/32'):
+            with self.assertRaises(serializers.ValidationError):
+                field.run_validation(value)
+
+    def test_plain_ip_address_field_trims_ipv6_whitespace(self):
+        # IPv6 input is normalized just like the IPv4 path already was.
+        field = serializers.IPAddressField()
+        self.assertEqual(
+            field.run_validation('  2001:0DB8::0001  '),
+            '2001:db8::1'
+        )
+        self.assertEqual(
+            field.run_validation(' ::ffff:192.0.2.1 '),
+            '192.0.2.1'
+        )
 
 
 class TestFilePathField(FieldValues):

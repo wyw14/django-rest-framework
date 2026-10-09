@@ -4,6 +4,7 @@ import datetime
 import decimal
 import functools
 import inspect
+import ipaddress
 import re
 import uuid
 import warnings
@@ -867,14 +868,121 @@ class IPAddressField(CharField):
         if not isinstance(data, str):
             self.fail('invalid', value=data)
 
-        if ':' in data:
+        # IPv6 cleaning does not strip whitespace itself, so do it here (as
+        # `CharField.to_internal_value` does for the IPv4 fallback below) and
+        # normalize hexadecimal hextets to their compressed form.
+        value = data.strip() if self.trim_whitespace else data
+        if ':' in value:
             try:
                 if self.protocol in ('both', 'ipv6'):
-                    return clean_ipv6_address(data, self.unpack_ipv4)
+                    return clean_ipv6_address(value, self.unpack_ipv4)
             except DjangoValidationError:
                 self.fail('invalid', value=data)
 
         return super().to_internal_value(data)
+
+
+class IPNetworkField(CharField):
+    """
+    Support IPv4/IPv6 addresses and networks in CIDR notation.
+
+    Values are normalized with the standard library's `ipaddress` module:
+    surrounding whitespace is stripped, IPv6 hextets are lowercased and
+    compressed, host bits are removed and netmasks or prefix lengths are
+    converted to a canonical prefix length, so the serialized output can be
+    parsed back again.
+    """
+
+    default_error_messages = {
+        'invalid': _('Enter a valid IPv4 or IPv6 address or network.'),
+    }
+
+    def __init__(self, protocol='both', **kwargs):
+        self.protocol = protocol.lower()
+        if self.protocol not in ('both', 'ipv4', 'ipv6'):
+            raise ValueError(
+                "The protocol '%s' is unknown. Supported protocols are "
+                "'both', 'IPv4' and 'IPv6'." % protocol
+            )
+        self.unpack_ipv4 = (self.protocol == 'both')
+        super().__init__(**kwargs)
+        if self.protocol == 'ipv4':
+            self.error_messages['invalid'] = _(
+                'Enter a valid IPv4 address or network.'
+            )
+        elif self.protocol == 'ipv6':
+            self.error_messages['invalid'] = _(
+                'Enter a valid IPv6 address or network.'
+            )
+
+    def to_internal_value(self, data):
+        if not isinstance(data, str):
+            self.fail('invalid', value=data)
+
+        value = data.strip() if self.trim_whitespace else data
+        try:
+            # `strict=False` canonicalizes inputs such as '192.0.2.5/24'.
+            network = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            # Covers malformed addresses, illegal prefix lengths, netmasks
+            # belonging to the other address family, etc.
+            self.fail('invalid', value=value)
+
+        # Reject values from the other address family, e.g. an IPv6 network
+        # for an IPv4-only field or vice versa.
+        if (
+            (self.protocol == 'ipv4' and network.version != 4)
+            or (self.protocol == 'ipv6' and network.version != 6)
+        ):
+            self.fail('invalid', value=value)
+
+        return self._canonical_value(network, has_prefix='/' in value)
+
+    def to_representation(self, value):
+        if isinstance(value, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+            return self._canonical_value(value, has_prefix=True)
+        if isinstance(value, (ipaddress.IPv4Interface, ipaddress.IPv6Interface)):
+            return self._canonical_value(value.network, has_prefix=True)
+        if isinstance(value, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+            return self._canonical_value(ipaddress.ip_network(value), has_prefix=False)
+
+        text = str(value)
+        candidate = text.strip() if self.trim_whitespace else text
+        try:
+            network = ipaddress.ip_network(candidate, strict=False)
+        except ValueError:
+            # Don't blow up serialization of values we cannot normalize.
+            return text
+        return self._canonical_value(network, has_prefix='/' in candidate)
+
+    def _canonical_value(self, network, has_prefix):
+        """
+        Return a canonical, re-parseable string for a parsed network.
+
+        `network` comes from `ipaddress.ip_network(..., strict=False)`, which
+        has already stripped host bits and validated the prefix length.
+        """
+        address = network.network_address
+        mapped = address.ipv4_mapped if network.version == 6 else None
+
+        if mapped is not None:
+            # IPv4-mapped IPv6 addresses (``::ffff:192.0.2.1``) are unpacked
+            # to plain IPv4 when protocol is 'both'. A mapped network can only
+            # be expressed as IPv4 when its prefix length fits in 32 bits,
+            # i.e. an IPv6 prefix length of 96 or more.
+            if self.unpack_ipv4 and (not has_prefix or network.prefixlen >= 96):
+                if has_prefix:
+                    return '%s/%d' % (mapped, network.prefixlen - 96)
+                return str(mapped)
+            # Keep a canonical textual form for mapped addresses regardless of
+            # the Python version (`::ffff:192.0.2.1`, never hexadecimal).
+            host = '::ffff:%s' % mapped
+        else:
+            host = str(address)
+
+        if has_prefix:
+            return '%s/%d' % (host, network.prefixlen)
+        return host
 
 
 # Number types...

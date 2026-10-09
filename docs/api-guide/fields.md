@@ -267,6 +267,16 @@ Corresponds to `django.forms.fields.IPAddressField` and `django.forms.fields.Gen
 * `protocol` Limits valid inputs to the specified protocol. Accepted values are 'both' (default), 'IPv4' or 'IPv6'. Matching is case-insensitive.
 * `unpack_ipv4` Unpacks IPv4 mapped addresses like ::ffff:192.0.2.1. If this option is enabled that address would be unpacked to 192.0.2.1. Default is disabled. Can only be used when protocol is set to 'both'.
 
+### IPNetworkField
+
+A field that ensures the input is a valid IPv4 or IPv6 address or network in CIDR notation (eg. `192.0.2.0/24` or `2001:db8::/32`). Plain addresses without a prefix (eg. `192.0.2.1`) are accepted as well.
+
+Values are normalized when they are validated: surrounding whitespace is stripped, IPv6 hextets are lowercased and compressed, host bits are removed, and netmasks and prefix lengths are converted to a canonical prefix length. This means the serialized output is always in a canonical form and can be parsed back again.
+
+**Signature**: `IPNetworkField(protocol='both', **options)`
+
+* `protocol` Limits valid inputs to the specified protocol. Accepted values are 'both' (default), 'IPv4' or 'IPv6'. Matching is case-insensitive. Values from the other protocol family, including IPv4-mapped IPv6 values on an IPv4-only field, are rejected.
+
 ---
 
 ## Numeric fields

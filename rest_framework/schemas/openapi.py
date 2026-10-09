@@ -456,6 +456,14 @@ class AutoSchema(ViewInspector):
                 content['format'] = field.protocol
             return content
 
+        if isinstance(field, serializers.IPNetworkField):
+            content = {
+                'type': 'string',
+            }
+            if field.protocol != 'both':
+                content['format'] = field.protocol
+            return content
+
         if isinstance(field, serializers.DecimalField):
             if getattr(field, 'coerce_to_string', api_settings.COERCE_DECIMAL_TO_STRING):
                 content = {

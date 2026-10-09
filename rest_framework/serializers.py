@@ -55,7 +55,7 @@ from rest_framework.validators import (
 from rest_framework.fields import (  # NOQA # isort:skip
     BigIntegerField, BooleanField, CharField, ChoiceField, DateField, DateTimeField, DecimalField,
     DictField, DurationField, EmailField, Field, FileField, FilePathField, FloatField,
-    HiddenField, HStoreField, IPAddressField, ImageField, IntegerField, JSONField,
+    HiddenField, HStoreField, IPAddressField, IPNetworkField, ImageField, IntegerField, JSONField,
     ListField, ModelField, MultipleChoiceField, ReadOnlyField,
     RegexField, SerializerMethodField, SlugField, TimeField, URLField, UUIDField,
 )
